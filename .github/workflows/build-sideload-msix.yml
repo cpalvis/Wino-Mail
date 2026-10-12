@@ -1,0 +1,123 @@
+name: Build Sideload MSIX
+
+on:
+  workflow_dispatch:
+    inputs:
+      architectures:
+        description: Architectures to build
+        required: true
+        default: x64
+        type: choice
+        options:
+          - x64
+          - x86
+          - ARM64
+          - All (x86, x64, ARM64)
+
+  push:
+    tags:
+      - "v[0-9]*"
+
+jobs:
+  build-sideload:
+    runs-on: windows-2022
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+      DOTNET_NOLOGO: "1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Build Release MSIX
+        shell: powershell
+        run: |
+          $arch = '${{ inputs.architectures }}'
+          if ($arch -eq 'All (x86, x64, ARM64)') {
+            $arch = @('x86', 'x64', 'ARM64')
+          }
+
+          $config = @{
+            Project = 'src/Wino.Mail.WinUI/Wino.Mail.WinUI.csproj'
+            Configuration = 'Release'
+            Architectures = $arch
+            ArtifactsPath = 'D:\build-artifacts'
+          }
+
+          # Read version from manifest
+          [xml]$manifest = Get-Content -LiteralPath 'src/Wino.Mail.WinUI/Package.appxmanifest'
+          $version = [string]$manifest.Package.Identity.Version
+          Write-Host "Building version: $version" -ForegroundColor Green
+
+          # Determine platform string for single-arch builds
+          if ($config.Architectures -is [string]) {
+            $platform = $config.Architectures
+          } else {
+            $platform = $config.Architectures[0]
+          }
+
+          # Build the project
+          dotnet build $config.Project `
+            -c $config.Configuration `
+            -p:Platform=$platform `
+            -p:RuntimeIdentifier="win-$($platform.ToLowerInvariant())" `
+            -p:ArtifactsPath=$config.ArtifactsPath `
+            -p:UapAppxPackageBuildMode=SideloadOnly `
+            -p:AppxBundle=Always `
+            -p:AppxBundlePlatforms="$($config.Architectures -join '|')" `
+            -p:AppxPackageSigningEnabled=false `
+            -p:GenerateTemporaryStoreCertificate=false `
+            -p:GenerateAppInstallerFile=false `
+            -p:AppxSymbolPackageEnabled=false
+
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Build failed" -ErrorAction Stop
+          }
+
+          Write-Host "Build completed successfully" -ForegroundColor Green
+
+      - name: Locate MSIX Bundle
+        id: locate
+        shell: powershell
+        run: |
+          $bundle = Get-ChildItem -Path 'D:\build-artifacts\*' -Filter '*.msixbundle' -Recurse | Select-Object -First 1
+          if (-not $bundle) {
+            Write-Error "No MSIX bundle found" -ErrorAction Stop
+          }
+          Write-Host "Found bundle: $($bundle.FullName)"
+          "path=$($bundle.FullName)" >> $env:GITHUB_OUTPUT
+          "filename=$($bundle.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Upload MSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: WinoMail-Sideload
+          path: ${{ steps.locate.outputs.path }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.locate.outputs.path }}
+          draft: false
+          prerelease: false
+          body: |
+            ## Sideload Installation
+            
+            1. Download the `.msixbundle` file below
+            2. Run this command in PowerShell as Administrator:
+               ```powershell
+               Add-AppxPackage -Path ".\${{ steps.locate.outputs.filename }}"
+               ```
+            3. Launch **Wino Mail** from your Start menu
+            
+            **Note:** This is an unsigned sideload build. Windows may show a security warning during installation.
