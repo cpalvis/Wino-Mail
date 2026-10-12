@@ -52,7 +52,8 @@ public static class Constants
 
     /// <summary>
     /// How many mail accounts can be added without the Unlimited Accounts add-on.
+    ///Modified 10/11/2026 by Colin Alvis under the terms of the GNU Public License
     /// </summary>
-    public const int FreeAccountLimit = 3;
+    public const int FreeAccountLimit = 999;
 }
 
