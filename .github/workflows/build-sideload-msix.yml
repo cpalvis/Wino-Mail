@@ -2,31 +2,20 @@ name: Build Sideload MSIX
 
 on:
   workflow_dispatch:
-    inputs:
-      architectures:
-        description: Architectures to build
-        required: true
-        default: x64
-        type: choice
-        options:
-          - x64
-          - x86
-          - ARM64
-          - All (x86, x64, ARM64)
-
   push:
     tags:
-      - "v[0-9]*"
+      - "v*"
 
 jobs:
-  build-sideload:
+  build-msix:
     runs-on: windows-2022
+
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: "1"
       DOTNET_NOLOGO: "1"
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -36,88 +25,94 @@ jobs:
         with:
           global-json-file: global.json
 
-      - name: Build Release MSIX
+      - name: Restore NuGet packages
         shell: powershell
         run: |
-          $arch = '${{ inputs.architectures }}'
-          if ($arch -eq 'All (x86, x64, ARM64)') {
-            $arch = @('x86', 'x64', 'ARM64')
+          dotnet restore src/Wino.Mail.WinUI/Wino.Mail.WinUI.csproj --configfile nuget.config
+          if ($LASTEXITCODE -ne 0) {
+            throw "dotnet restore failed"
           }
 
-          $config = @{
-            Project = 'src/Wino.Mail.WinUI/Wino.Mail.WinUI.csproj'
-            Configuration = 'Release'
-            Architectures = $arch
-            ArtifactsPath = 'D:\build-artifacts'
-          }
+      - name: Build unsigned MSIX bundle
+        shell: powershell
+        run: |
+          $artifactRoot = Join-Path $env:GITHUB_WORKSPACE "artifacts"
+          New-Item -ItemType Directory -Force -Path $artifactRoot | Out-Null
 
-          # Read version from manifest
-          [xml]$manifest = Get-Content -LiteralPath 'src/Wino.Mail.WinUI/Package.appxmanifest'
+          [xml]$manifest = Get-Content -LiteralPath "src/Wino.Mail.WinUI/Package.appxmanifest" -Raw
           $version = [string]$manifest.Package.Identity.Version
-          Write-Host "Building version: $version" -ForegroundColor Green
+          Write-Host "Building Wino Mail version: $version" -ForegroundColor Green
 
-          # Determine platform string for single-arch builds
-          if ($config.Architectures -is [string]) {
-            $platform = $config.Architectures
-          } else {
-            $platform = $config.Architectures[0]
-          }
-
-          # Build the project
-          dotnet build $config.Project `
-            -c $config.Configuration `
-            -p:Platform=$platform `
-            -p:RuntimeIdentifier="win-$($platform.ToLowerInvariant())" `
-            -p:ArtifactsPath=$config.ArtifactsPath `
-            -p:UapAppxPackageBuildMode=SideloadOnly `
+          dotnet build src/Wino.Mail.WinUI/Wino.Mail.WinUI.csproj `
+            -c Release `
+            -p:Platform=x64 `
+            -p:RuntimeIdentifier=win-x64 `
+            -p:GenerateAppxPackageOnBuild=true `
             -p:AppxBundle=Always `
-            -p:AppxBundlePlatforms="$($config.Architectures -join '|')" `
+            -p:AppxBundlePlatforms=x64 `
+            -p:UapAppxPackageBuildMode=SideloadOnly `
             -p:AppxPackageSigningEnabled=false `
             -p:GenerateTemporaryStoreCertificate=false `
             -p:GenerateAppInstallerFile=false `
-            -p:AppxSymbolPackageEnabled=false
+            -p:AppxSymbolPackageEnabled=false `
+            -p:AppxPackageDir=$artifactRoot `
+            -v:minimal
 
           if ($LASTEXITCODE -ne 0) {
-            Write-Error "Build failed" -ErrorAction Stop
+            throw "MSIX build failed"
           }
 
-          Write-Host "Build completed successfully" -ForegroundColor Green
+          Write-Host "Artifacts created under: $artifactRoot" -ForegroundColor Green
+          Get-ChildItem -Path $artifactRoot -Recurse | Select-Object FullName, Length
 
-      - name: Locate MSIX Bundle
-        id: locate
+      - name: Find built MSIX bundle
+        id: find_bundle
         shell: powershell
         run: |
-          $bundle = Get-ChildItem -Path 'D:\build-artifacts\*' -Filter '*.msixbundle' -Recurse | Select-Object -First 1
+          $bundle = Get-ChildItem -Path $env:GITHUB_WORKSPACE -Filter *.msixbundle -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
           if (-not $bundle) {
-            Write-Error "No MSIX bundle found" -ErrorAction Stop
+            Write-Error "No .msixbundle file was found under $env:GITHUB_WORKSPACE"
+            exit 1
           }
+
           Write-Host "Found bundle: $($bundle.FullName)"
-          "path=$($bundle.FullName)" >> $env:GITHUB_OUTPUT
+          "bundle=$($bundle.FullName)" >> $env:GITHUB_OUTPUT
           "filename=$($bundle.Name)" >> $env:GITHUB_OUTPUT
 
       - name: Upload MSIX artifact
         uses: actions/upload-artifact@v4
         with:
-          name: WinoMail-Sideload
-          path: ${{ steps.locate.outputs.path }}
-          retention-days: 30
+          name: WinoMail-msix
+          path: ${{ steps.find_bundle.outputs.bundle }}
           if-no-files-found: error
+          retention-days: 30
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.locate.outputs.path }}
+          files: ${{ steps.find_bundle.outputs.bundle }}
           draft: false
           prerelease: false
           body: |
-            ## Sideload Installation
-            
+            ## Wino Mail Sideload Package
+
+            This is an unsigned sideload build for local installation. **Windows may show security warnings during installation.** 
+
+            ### Installation
+
             1. Download the `.msixbundle` file below
-            2. Run this command in PowerShell as Administrator:
+            2. Open PowerShell as Administrator
+            3. Run the following command:
                ```powershell
-               Add-AppxPackage -Path ".\${{ steps.locate.outputs.filename }}"
+               Add-AppxPackage -Path ".\${{ steps.find_bundle.outputs.filename }}"
                ```
-            3. Launch **Wino Mail** from your Start menu
-            
-            **Note:** This is an unsigned sideload build. Windows may show a security warning during installation.
+            4. Launch **Wino Mail** from your Start menu
+
+            ### What is this?
+
+            This build is **not signed** and **not published to the Microsoft Store**. It is for users who want to run the latest development version locally.
+
+            To uninstall: Settings → Apps → Apps & features → Wino Mail (Preview) → Uninstall
